@@ -384,17 +384,18 @@ export class LoadBalancer extends DurableObject {
 	async handleCompletions(req: any, apiKey: string) {
 		const DEFAULT_MODEL = 'gemini-2.5-flash';
 		let model = DEFAULT_MODEL;
+		const requestedModel = typeof req.model === 'string' ? req.model : undefined;
 
 		switch (true) {
-			case typeof req.model !== 'string':
+			case typeof requestedModel !== 'string':
 				break;
-			case req.model.startsWith('models/'):
-				model = req.model.substring(7);
+			case requestedModel.startsWith('models/'):
+				model = requestedModel.substring(7);
 				break;
-			case req.model.startsWith('gemini-'):
-			case req.model.startsWith('gemma-'):
-			case req.model.startsWith('learnlm-'):
-				model = req.model;
+			case requestedModel.startsWith('gemini-'):
+			case requestedModel.startsWith('gemma-'):
+			case requestedModel.startsWith('learnlm-'):
+				model = requestedModel;
 		}
 
 		let body = await this.transformRequest(req);
@@ -415,7 +416,7 @@ export class LoadBalancer extends DurableObject {
 		switch (true) {
 			case model.endsWith(':search'):
 				model = model.substring(0, model.length - 7);
-			case req.model.endsWith('-search-preview'):
+			case requestedModel?.endsWith('-search-preview'):
 			case req.tools?.some((tool: any) => tool.function?.name === 'googleSearch'):
 				body.tools = body.tools || [];
 				body.tools.push({ function_declarations: [{ name: 'googleSearch', parameters: {} }] });
@@ -458,6 +459,12 @@ export class LoadBalancer extends DurableObject {
 							id,
 							last: [],
 							reasoningLast: [],
+							started: [],
+							toolCallsLast: [],
+							toolCallsSeen: [],
+							buildToolCallId: this.buildToolCallId.bind(this),
+							getDeltaText: this.getDeltaText.bind(this),
+							mapFinishReason: this.mapFinishReason.bind(this),
 							shared,
 						} as any)
 					)
@@ -571,15 +578,23 @@ export class LoadBalancer extends DurableObject {
 		}
 
 		const contents: any[] = [];
+		const toolCallsById = new Map<string, string>();
 		let system_instruction;
 
 		for (const item of messages) {
+			const parts = await this.transformMsg(item, toolCallsById);
+			let role = item.role;
+
 			switch (item.role) {
 				case 'system':
-					system_instruction = { parts: await this.transformMsg(item) };
+					system_instruction = { parts };
 					continue;
 				case 'assistant':
-					item.role = 'model';
+					role = 'model';
+					break;
+				case 'tool':
+				case 'function':
+					role = 'user';
 					break;
 				case 'user':
 					break;
@@ -588,23 +603,73 @@ export class LoadBalancer extends DurableObject {
 			}
 
 			if (system_instruction) {
-				// 修复：确保 parts 是数组后再调用 some 方法
 				if (!contents[0]?.parts || (Array.isArray(contents[0]?.parts) && !contents[0]?.parts.some((part: any) => part.text))) {
 					contents.unshift({ role: 'user', parts: [{ text: ' ' }] });
 				}
 			}
 
 			contents.push({
-				role: item.role,
-				parts: await this.transformMsg(item),
+				role,
+				parts,
 			});
 		}
 
 		return { system_instruction, contents };
 	}
 
-	private async transformMsg({ content }: any) {
+	private async transformMsg(message: any, toolCallsById: Map<string, string>) {
+		const { role, content, tool_calls, function_call, tool_call_id, name } = message;
 		const parts = [];
+
+		if (role === 'assistant') {
+			for (let index = 0; index < (tool_calls?.length || 0); index++) {
+				const toolCall = tool_calls[index];
+				if (toolCall?.type !== 'function' || !toolCall.function?.name) {
+					continue;
+				}
+
+				if (toolCall.id) {
+					toolCallsById.set(toolCall.id, toolCall.function.name);
+				}
+
+				parts.push({
+					functionCall: {
+						name: toolCall.function.name,
+						args: this.parseToolArguments(toolCall.function.arguments, toolCall.function.name),
+					},
+				});
+			}
+
+			if (function_call?.name) {
+				parts.push({
+					functionCall: {
+						name: function_call.name,
+						args: this.parseToolArguments(function_call.arguments, function_call.name),
+					},
+				});
+			}
+		}
+
+		if (role === 'tool' || role === 'function') {
+			const functionName = role === 'function' ? name : toolCallsById.get(tool_call_id);
+			if (!functionName) {
+				throw new HttpError(`Unknown tool call id: "${tool_call_id}"`, 400);
+			}
+
+			parts.push({
+				functionResponse: {
+					name: functionName,
+					response: this.parseToolResponse(content),
+				},
+			});
+
+			return parts;
+		}
+
+		if (content == null) {
+			return parts;
+		}
+
 		if (!Array.isArray(content)) {
 			parts.push({ text: content });
 			return parts;
@@ -632,10 +697,54 @@ export class LoadBalancer extends DurableObject {
 		}
 
 		if (content.every((item) => item.type === 'image_url')) {
-			parts.push({ text: '' }); // to avoid "Unable to submit request because it must have a text parameter"
+			parts.push({ text: '' });
 		}
+
 		return parts;
 	}
+
+	private parseToolArguments(rawArguments: any, functionName: string) {
+		if (rawArguments == null || rawArguments === '') {
+			return {};
+		}
+
+		if (typeof rawArguments === 'string') {
+			try {
+				const parsed = JSON.parse(rawArguments);
+				return typeof parsed === 'object' && parsed !== null ? parsed : { value: parsed };
+			} catch {
+				throw new HttpError(`Invalid arguments for function: "${functionName}"`, 400);
+			}
+		}
+
+		if (typeof rawArguments === 'object') {
+			return rawArguments;
+		}
+
+		return { value: rawArguments };
+	}
+
+	private parseToolResponse(content: any) {
+		if (typeof content === 'string') {
+			try {
+				const parsed = JSON.parse(content);
+				return typeof parsed === 'object' && parsed !== null ? parsed : { value: parsed };
+			} catch {
+				return { content };
+			}
+		}
+
+		if (content == null) {
+			return {};
+		}
+
+		if (typeof content === 'object') {
+			return content;
+		}
+
+		return { value: content };
+	}
+
 	private async parseImg(url: any) {
 		let mimeType, data;
 		if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -665,8 +774,10 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	private adjustSchema(schema: any) {
-		const obj = schema[schema.type];
-		delete obj.strict;
+		const obj = schema?.[schema?.type];
+		if (obj && typeof obj === 'object' && 'strict' in obj) {
+			delete obj.strict;
+		}
 		return this.adjustProps(schema);
 	}
 
@@ -675,12 +786,12 @@ export class LoadBalancer extends DurableObject {
 			return;
 		}
 		if (Array.isArray(schemaPart)) {
-			schemaPart.forEach(this.adjustProps);
+			schemaPart.forEach((item) => this.adjustProps(item));
 		} else {
 			if (schemaPart.type === 'object' && schemaPart.properties && schemaPart.additionalProperties === false) {
 				delete schemaPart.additionalProperties;
 			}
-			Object.values(schemaPart).forEach(this.adjustProps);
+			Object.values(schemaPart).forEach((item) => this.adjustProps(item));
 		}
 	}
 
@@ -689,16 +800,26 @@ export class LoadBalancer extends DurableObject {
 		if (req.tools) {
 			const funcs = req.tools.filter((tool: any) => tool.type === 'function' && tool.function?.name !== 'googleSearch');
 			if (funcs.length > 0) {
-				funcs.forEach(this.adjustSchema);
+				funcs.forEach((schema: any) => this.adjustSchema(schema));
 				tools = [{ function_declarations: funcs.map((schema: any) => schema.function) }];
 			}
 		}
 		if (req.tool_choice) {
 			const allowed_function_names = req.tool_choice?.type === 'function' ? [req.tool_choice?.function?.name] : undefined;
 			if (allowed_function_names || typeof req.tool_choice === 'string') {
+				const modeMap: Record<string, string> = {
+					auto: 'AUTO',
+					none: 'NONE',
+					required: 'ANY',
+				};
+				const mode = allowed_function_names ? 'ANY' : modeMap[req.tool_choice];
+				if (!mode) {
+					throw new HttpError('Unsupported tool_choice', 400);
+				}
+
 				tool_config = {
 					function_calling_config: {
-						mode: allowed_function_names ? 'ANY' : req.tool_choice.toUpperCase(),
+						mode,
 						allowed_function_names,
 					},
 				};
@@ -716,11 +837,11 @@ export class LoadBalancer extends DurableObject {
 		};
 
 		const transformCandidatesMessage = (cand: any) => {
-			const message = { role: 'assistant', content: [] as string[] };
 			let reasoningContent = '';
 			let finalContent = '';
+			const toolCalls = [] as any[];
 
-			for (const part of cand.content?.parts ?? []) {
+			for (const [partIndex, part] of (cand.content?.parts ?? []).entries()) {
 				if (part.text) {
 					// 检查是否是思考内容
 					// Gemini API 可能使用多种方式标识思考内容
@@ -748,6 +869,15 @@ export class LoadBalancer extends DurableObject {
 						// 这是正常的回答内容
 						finalContent += part.text;
 					}
+				} else if (part.functionCall?.name) {
+					toolCalls.push({
+						id: this.buildToolCallId(id, cand.index || 0, partIndex),
+						type: 'function',
+						function: {
+							name: part.functionCall.name,
+							arguments: JSON.stringify(part.functionCall.args || {}),
+						},
+					});
 				}
 			}
 
@@ -758,8 +888,12 @@ export class LoadBalancer extends DurableObject {
 					content: finalContent || null,
 				},
 				logprobs: null,
-				finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+				finish_reason: this.mapFinishReason(cand.finishReason, toolCalls.length > 0, reasonsMap),
 			};
+
+			if (toolCalls.length > 0) {
+				messageObj.message.tool_calls = toolCalls;
+			}
 
 			// 如果有思考内容，添加到响应中
 			if (reasoningContent) {
@@ -804,8 +938,18 @@ export class LoadBalancer extends DurableObject {
 	private parseStreamFlush(this: any, controller: any) {
 		if (this.buffer) {
 			try {
-				controller.enqueue(JSON.parse(this.buffer));
-				this.shared.is_buffers_rest = true;
+				const lines = this.buffer.split('\n').filter(Boolean);
+				for (const line of lines) {
+					if (!line.startsWith('data: ')) {
+						continue;
+					}
+
+					const data = line.substring(6);
+					if (data.startsWith('{')) {
+						controller.enqueue(JSON.parse(data));
+						this.shared.is_buffers_rest = true;
+					}
+				}
 			} catch (e) {
 				console.error('Error parsing remaining buffer:', e);
 			}
@@ -832,13 +976,27 @@ export class LoadBalancer extends DurableObject {
 		if (candidates) {
 			for (const cand of candidates) {
 				const { index, content, finishReason } = cand;
-				const { parts } = content;
+				const { parts = [] } = content || {};
+
+				if (!this.started[index]) {
+					this.started[index] = true;
+					controller.enqueue(
+						`data: ${JSON.stringify({
+							id: this.id,
+							object: 'chat.completion.chunk',
+							created: Math.floor(Date.now() / 1000),
+							model: this.model,
+							choices: [{ index, delta: { role: 'assistant' }, finish_reason: null }],
+						})}\n\n`
+					);
+				}
 
 				// 分别处理思考内容和正常内容
 				let reasoningText = '';
 				let finalText = '';
+				let hasToolCalls = false;
 
-				for (const part of parts) {
+				for (const [partIndex, part] of parts.entries()) {
 					if (part.text) {
 						// 检查是否是思考内容
 						// Gemini API 可能使用多种方式标识思考内容
@@ -865,6 +1023,50 @@ export class LoadBalancer extends DurableObject {
 						} else {
 							// 这是正常的回答内容
 							finalText += part.text;
+						}
+					} else if (part.functionCall?.name) {
+						hasToolCalls = true;
+						if (!this.toolCallsLast[index]) {
+							this.toolCallsLast[index] = {};
+						}
+
+						const toolId = this.buildToolCallId(this.id, index, partIndex);
+						const currentArgs = JSON.stringify(part.functionCall.args || {});
+						const previous = this.toolCallsLast[index][partIndex] || { name: '', arguments: '' };
+						const nameChanged = previous.name !== part.functionCall.name;
+						const argumentsDelta = this.getDeltaText(previous.arguments, currentArgs);
+
+						this.toolCallsLast[index][partIndex] = {
+							name: part.functionCall.name,
+							arguments: currentArgs,
+						};
+						this.toolCallsSeen[index] = true;
+
+						if (nameChanged || argumentsDelta) {
+							const toolCallDelta: any = {
+								index: partIndex,
+								id: toolId,
+								type: 'function',
+								function: {},
+							};
+
+							if (nameChanged) {
+								toolCallDelta.function.name = part.functionCall.name;
+							}
+
+							if (argumentsDelta) {
+								toolCallDelta.function.arguments = argumentsDelta;
+							}
+
+							controller.enqueue(
+								`data: ${JSON.stringify({
+									id: this.id,
+									object: 'chat.completion.chunk',
+									created: Math.floor(Date.now() / 1000),
+									model: this.model,
+									choices: [{ index, delta: { tool_calls: [toolCallDelta] }, finish_reason: null }],
+								})}\n\n`
+							);
 						}
 					}
 				}
@@ -954,6 +1156,7 @@ export class LoadBalancer extends DurableObject {
 
 				// 如果有完成原因，发送完成信号
 				if (finishReason) {
+					const finishReasonValue = this.mapFinishReason(finishReason, hasToolCalls || !!this.toolCallsSeen[index], reasonsMap);
 					const finishObj = {
 						id: this.id,
 						object: 'chat.completion.chunk',
@@ -963,7 +1166,7 @@ export class LoadBalancer extends DurableObject {
 							{
 								index,
 								delta: {},
-								finish_reason: reasonsMap[finishReason] || finishReason,
+								finish_reason: finishReasonValue,
 							},
 						],
 					};
@@ -980,18 +1183,41 @@ export class LoadBalancer extends DurableObject {
 				object: 'chat.completion.chunk',
 				created: Math.floor(Date.now() / 1000),
 				model: this.model,
-				choices: [
-					{
-						index: 0,
-						delta: {},
-						finish_reason: 'stop',
-					},
-				],
+				choices: [],
 				usage: this.shared.usage,
 			};
 			controller.enqueue(`data: ${JSON.stringify(obj)}\n\n`);
 		}
 		controller.enqueue('data: [DONE]\n\n');
+	}
+
+	private getDeltaText(previous: string, current: string) {
+		if (current.startsWith(previous)) {
+			return current.substring(previous.length);
+		}
+
+		let i = 0;
+		while (i < current.length && i < previous.length && current[i] === previous[i]) {
+			i++;
+		}
+
+		return current.substring(i);
+	}
+
+	private buildToolCallId(responseId: string, candidateIndex: number, partIndex: number) {
+		return `call_${responseId}_${candidateIndex}_${partIndex}`;
+	}
+
+	private mapFinishReason(
+		finishReason: string | undefined,
+		hasToolCalls: boolean,
+		reasonsMap: Record<string, string>
+	) {
+		if (hasToolCalls) {
+			return 'tool_calls';
+		}
+
+		return finishReason ? reasonsMap[finishReason] || finishReason : finishReason;
 	}
 	// =================================================================================================
 	// Admin API Handlers
@@ -1244,7 +1470,8 @@ export class LoadBalancer extends DurableObject {
 		};
 		const errHandler = (err: Error) => {
 			console.error(err);
-			return new Response(err.message, fixCors({ statusText: err.message ?? 'Internal Server Error', status: 500 }));
+			const status = err instanceof HttpError ? err.status : 500;
+			return new Response(err.message, fixCors({ statusText: err.message ?? 'Internal Server Error', status }));
 		};
 
 		switch (true) {
